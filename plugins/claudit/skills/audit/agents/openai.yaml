@@ -1,0 +1,16 @@
+interface:
+  display_name: "Claudit"
+  short_description: "Invoke Claudit from Codex with $claudit"
+  default_prompt: "$claudit Audit the current Codex thread."
+
+dependencies:
+  tools:
+    - type: "cli"
+      value: "claude"
+      description: "Claude Code CLI"
+    - type: "cli"
+      value: "jq"
+      description: "JSON processor used for Codex transcript extraction"
+    - type: "cli"
+      value: "curl"
+      description: "HTTP client used for token preview"

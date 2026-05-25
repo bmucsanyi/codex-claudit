@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf '%s\n' 'Usage: extract-transcript SESSION_FILE NUM_MESSAGES [full|conversation]'
+}
+
+if (($# < 2 || $# > 3)); then
+  usage >&2
+  exit 2
+fi
+
+session_file="$1"
+num_messages="$2"
+render_mode="${3:-full}"
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' 'extract-transcript: jq is required' >&2
+  exit 2
+fi
+
+if [[ "$num_messages" != "-1" ]] && [[ ! "$num_messages" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' 'extract-transcript: NUM_MESSAGES must be -1 or a positive integer' >&2
+  exit 2
+fi
+
+if [[ "$render_mode" != "full" && "$render_mode" != "conversation" ]]; then
+  printf '%s\n' 'extract-transcript: mode must be full or conversation' >&2
+  exit 2
+fi
+
+jq -rs --argjson num_messages "$num_messages" --arg render_mode "$render_mode" '
+  def payload_object:
+    if (.payload | type) == "object" then .payload else {} end;
+
+  def content_text:
+    (.content // [])
+    | if type == "array" then . else [] end
+    | map(select(type == "object"))
+    | map(.text // "")
+    | map(select(type == "string" and . != ""))
+    | join("\n\n");
+
+  def text_value:
+    if . == null then ""
+    elif type == "string" then .
+    else tojson
+    end;
+
+  def name_value:
+    (text_value) as $text
+    | if $text == "" then "unknown" else $text end;
+
+  def parse_json_text($value):
+    ($value | text_value) as $raw
+    | try ($raw | fromjson) catch null;
+
+  def fenced_text($text):
+    ([($text | scan("`+") | length)] | max // 0) as $max_ticks
+    | ("`" * ([3, ($max_ticks + 1)] | max)) as $fence
+    | ($text | split("\n")) as $lines
+    | (if ($text | endswith("\n")) then $lines[0:-1] else $lines end | map(" " + .) | join("\n")) as $body
+    | $fence + "text\n" + $body + (if ($body | endswith("\n")) then "" else "\n" end) + $fence + "\n";
+
+  def cleaned_tool_output:
+    text_value as $raw
+    | ($raw | split("\n")) as $lines
+    | ([range(0; ($lines | length)) | select($lines[.] == "Output:")] | first) as $output_index
+    | if $output_index == null then
+        $raw
+      else
+        ([
+          $lines[0:$output_index][]
+          | select(
+              startswith("Chunk ID: ")
+              or startswith("Wall time: ")
+              or startswith("Original token count: ")
+              or test("^Process exited with code ")
+              or startswith("Process running with session ID ")
+            )
+        ] | length) as $metadata_count
+        | if $metadata_count == 0 then
+            $raw
+          else
+            ([
+              $lines[0:$output_index][]
+              | select(
+                  (. != "Process exited with code 0" and test("^Process exited with code "))
+                  or startswith("Process running with session ID ")
+                )
+            ]) as $status
+            | ($lines[($output_index + 1):] | join("\n")) as $body
+            | if ($status | length) == 0 then
+                $body
+              elif $body == "" then
+                ($status | join("\n"))
+              else
+                ($status | join("\n")) + "\n" + $body
+              end
+          end
+      end;
+
+  def output_text($body; $exchange; $seen):
+    if ($seen[$body] // null) != null then
+      {seen: $seen, text: ("[output identical to tool exchange " + ($seen[$body] | tostring) + "]\n")}
+    else
+      {seen: ($seen + {($body): $exchange}), text: fenced_text($body)}
+    end;
+
+  def split_local_instruction:
+    index("\n\n<environment_context>") as $context_index
+    | if $context_index == null then
+        {body: ., context: ""}
+      else
+        {body: .[0:$context_index], context: .[($context_index + 2):]}
+      end;
+
+  def environment_context_text($context):
+    if $context == "" then "" else "[E]\n" + $context + "\n\n" end;
+
+  def command_text:
+    (text_value) as $raw
+    | try (
+        ($raw | fromjson) as $parsed
+        | if ($parsed | type) == "object" and ($parsed.cmd | type) == "string" then $parsed.cmd else $raw end
+      ) catch $raw;
+
+  def invokes_claudit:
+    command_text
+    | sub("^[[:space:]]+"; "")
+    | test("^\"?[^\"[:space:]]*/scripts/claudit(\"|[[:space:]]|$)|^claudit([[:space:]]|$)|^(bash|sh)[[:space:]]+[^[:space:]]*/scripts/claudit([[:space:]]|$)");
+
+  def invokes_claudit_mention:
+    sub("^[[:space:]]+"; "")
+    | test("^\\$claudit(:audit|:tokens)?([[:space:]]|$)");
+
+  def invokes_claudit_user_shell_record:
+    test("(?s)<user_shell_command>.*<command>[[:space:]]*claudit([[:space:]]|</command>|$)");
+
+  def invokes_claudit_context:
+    startswith("The immediately preceding user message was handled by Claudit");
+
+  def is_claudit_token_preview_response:
+    (
+      startswith("Claudit token preview:")
+      or startswith("Token preview for `$claudit:tokens")
+      or startswith("Token preview for $claudit:tokens")
+    )
+    and contains("input_tokens:")
+    and contains("prompt_lines:")
+    and contains("prompt_bytes:");
+
+  def is_local_instructions:
+    startswith("# AGENTS.md instructions for ");
+
+  def role_sigils($phase):
+    if $phase == "commentary" then "[C]"
+    elif $phase == "final_answer" then "[A]"
+    elif $phase == "" then "[M]"
+    else "[M " + $phase + "]"
+    end;
+
+  def parallel_tool_line($tool):
+    ($tool.recipient_name | name_value) as $recipient
+    | ($tool.parameters // {}) as $params
+    | if (($recipient | test("(^|\\.)exec_command$")) and (($params.cmd | type) == "string")) then
+        "$ " + $params.cmd + "\n"
+      else
+        "[" + $recipient + "] " + ($params | tojson) + "\n"
+      end;
+
+  def function_call_text:
+    (payload_object) as $payload
+    | ($payload.name | name_value) as $name
+    | (parse_json_text($payload.arguments)) as $args
+    | if (($name | test("(^|\\.)exec_command$")) and (($args | type) == "object") and (($args.cmd | type) == "string")) then
+        "[exec]\n$ " + $args.cmd + "\n"
+      elif $name == "multi_tool_use.parallel" and (($args.tool_uses | type) == "array") then
+        "[multi_tool_use.parallel]\n" + ($args.tool_uses | map(parallel_tool_line(.)) | join(""))
+      else
+        "[" + $name + "]\n" + fenced_text($payload.arguments | text_value)
+      end;
+
+  def custom_tool_call_text:
+    (payload_object) as $payload
+    | ($payload.name | name_value) as $name
+    | "[" + $name + "]\n" + fenced_text($payload.input | text_value);
+
+  def web_search_text:
+    (payload_object.action // null) as $action
+    | if ($action | type) == "object" then
+        if (($action.queries | type) == "array") then
+          "[web_search] queries=" + ($action.queries | map(text_value) | join(" | ")) + "\n"
+        elif (($action.query | type) == "string") then
+          "[web_search] query=" + $action.query + "\n"
+        elif (($action.url | type) == "string") then
+          "[web_search] " + ($action.type | text_value) + " url=" + $action.url + "\n"
+        else
+          "[web_search] " + ($action | tojson) + "\n"
+        end
+      else
+        "[web_search] " + ($action | text_value) + "\n"
+      end;
+
+  def patch_output_text:
+    [
+      (.stdout | text_value),
+      (.stderr | text_value)
+    ]
+    | map(select(. != ""))
+    | join("\n");
+
+  def rendered_record:
+    if .type == "response_item" and payload_object.type == "message" and payload_object.role == "user" then
+      (payload_object | content_text) as $text
+      | if ($text | invokes_claudit_mention or invokes_claudit_user_shell_record or invokes_claudit_context) then
+        {kind: "claudit"}
+      elif $text == "" then
+        empty
+      elif ($text | is_local_instructions) then
+        ($text | split_local_instruction) as $instruction
+        | {kind: "instructions", body: $instruction.body, context: $instruction.context}
+      else
+        {kind: "user", text: ("[U]\n" + $text + "\n\n")}
+      end
+    elif .type == "response_item" and payload_object.type == "message" and payload_object.role == "assistant" then
+      (payload_object | content_text) as $text
+      | if $text == "" or ($text | is_claudit_token_preview_response) then
+        empty
+      else
+        (payload_object.phase | text_value) as $phase
+        | {kind: "other", text: (role_sigils($phase) + "\n" + $text + "\n\n")}
+      end
+    elif .type == "response_item" and payload_object.type == "function_call" then
+      if (payload_object.arguments | invokes_claudit) then
+        {kind: "claudit"}
+      else
+        {kind: "tool_call", call_id: (payload_object.call_id | text_value), text: function_call_text}
+      end
+    elif .type == "response_item" and payload_object.type == "custom_tool_call" then
+      if (payload_object.input | invokes_claudit) then
+        {kind: "claudit"}
+      else
+        {kind: "tool_call", call_id: (payload_object.call_id | text_value), text: custom_tool_call_text}
+      end
+    elif .type == "response_item" and payload_object.type == "function_call_output" then
+      {kind: "tool_output", call_id: (payload_object.call_id | text_value), output: (payload_object.output | cleaned_tool_output)}
+    elif .type == "response_item" and payload_object.type == "custom_tool_call_output" then
+      {kind: "tool_output", call_id: (payload_object.call_id | text_value), output: (payload_object.output | cleaned_tool_output)}
+    elif .type == "response_item" and payload_object.type == "web_search_call" then
+      {kind: "web_search", text: (web_search_text + "\n")}
+    elif .type == "patch_apply_end" then
+      (patch_output_text) as $patch_output
+      | if $patch_output == "" then empty else {kind: "patch_output", output: $patch_output} end
+    else
+      empty
+    end;
+
+  def render_window($outputs_by_call; $call_ids):
+    reduce .[] as $record ({items: [], seen: {}, exchange: 0, seen_instruction: {}, instruction: 0};
+      if $record.kind == "instructions" then
+        (.instruction + 1) as $instruction
+        | if (.seen_instruction[$record.body] // null) != null then
+            .instruction = $instruction
+            | .items += ["[I identical to instruction block " + (.seen_instruction[$record.body] | tostring) + "]\n\n" + environment_context_text($record.context)]
+          else
+            .instruction = $instruction
+            | .seen_instruction += {($record.body): $instruction}
+            | .items += ["[I]\n" + $record.body + "\n\n" + environment_context_text($record.context)]
+          end
+      elif $record.kind == "tool_call" then
+        ($outputs_by_call[$record.call_id] // null) as $output_record
+        | if $output_record == null then
+            .items += [$record.text + "\n"]
+          else
+            (.exchange + 1) as $exchange
+            | output_text($output_record.output; $exchange; .seen) as $output
+            | .exchange = $exchange
+            | .seen = $output.seen
+            | .items += [$record.text + $output.text + "\n"]
+          end
+      elif $record.kind == "tool_output" then
+        if $record.call_id != "" and (($call_ids[$record.call_id] // false) == true) then
+          .
+        else
+          (.exchange + 1) as $exchange
+          | output_text($record.output; $exchange; .seen) as $output
+          | .exchange = $exchange
+          | .seen = $output.seen
+          | .items += ["[tool_output]\n" + $output.text + "\n"]
+        end
+      elif $record.kind == "patch_output" then
+        (.exchange + 1) as $exchange
+        | output_text($record.output; $exchange; .seen) as $output
+        | .exchange = $exchange
+        | .seen = $output.seen
+        | .items += ["[patch_output]\n" + $output.text + "\n"]
+      else
+        .items += [$record.text]
+      end
+    )
+    | .items[];
+
+  map(rendered_record) as $records
+  | ($records | map(select(.kind != "claudit"))) as $visible
+  | ([range(0; ($visible | length)) | select($visible[.].kind == "user")]) as $user_indices
+  | ([range(0; ($visible | length)) | select($visible[.].kind == "instructions")]) as $instruction_indices
+  | ($user_indices | length) as $user_count
+  | if $user_count == 0 then
+      empty
+    else
+      (if $num_messages == -1 then $user_indices[0] else $user_indices[([0, ($user_count - $num_messages)] | max)] end) as $user_start_index
+      | ([ $instruction_indices[] | select(. <= $user_start_index) ] | last) as $instruction_index
+      | (
+          (if $instruction_index == null then [] else [$visible[$instruction_index]] end)
+          + $visible[$user_start_index:]
+        ) as $window
+      | (
+          if $render_mode == "conversation" then
+            $window | map(select(.kind == "instructions" or .kind == "user" or .kind == "other"))
+          else
+            $window
+          end
+        ) as $window
+      | (
+          if $render_mode == "full" and ($window | any(.kind == "web_search")) then
+            [{kind: "metadata", text: "[S]\nweb_search_result_bodies=unavailable_in_codex_session_jsonl\n\n"}] + $window
+          else
+            $window
+          end
+        ) as $window
+      | ($window | map(select(.kind == "tool_output" and .call_id != "")) | map({key: .call_id, value: .}) | from_entries) as $outputs_by_call
+      | ($window | map(select(.kind == "tool_call" and .call_id != "")) | map({key: .call_id, value: true}) | from_entries) as $call_ids
+      | $window | render_window($outputs_by_call; $call_ids)
+    end
+' "$session_file"

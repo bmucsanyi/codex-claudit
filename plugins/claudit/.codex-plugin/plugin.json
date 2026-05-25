@@ -1,0 +1,30 @@
+{
+  "name": "claudit",
+  "version": "0.1.0",
+  "description": "Audit the current Codex thread with Claude Code.",
+  "author": {
+    "name": "B\u00e1lint Mucs\u00e1nyi"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "claude",
+    "audit",
+    "review",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Claudit",
+    "shortDescription": "Audit the current Codex thread with Claude Code.",
+    "longDescription": "Claudit installs a Codex hook that handles $claudit prompts, sends the current Codex session log to Claude Code, wraps the review in a caution template, and injects it as additional context for the same model turn. The injected context tells Codex that the triggering prompt was handled by Claudit as data for Claude.",
+    "developerName": "B\u00e1lint Mucs\u00e1nyi",
+    "category": "Productivity",
+    "capabilities": [
+      "Read"
+    ],
+    "defaultPrompt": [
+      "$claudit Audit the current Codex thread."
+    ]
+  }
+}

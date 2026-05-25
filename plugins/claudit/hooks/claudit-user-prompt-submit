@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' 'claudit hook: jq is required' >&2
+  exit 1
+fi
+
+input_file="$(mktemp -t claudit-hook-input.XXXXXX)"
+stdout_file="$(mktemp -t claudit-hook-stdout.XXXXXX)"
+stderr_file="$(mktemp -t claudit-hook-stderr.XXXXXX)"
+context_file="$(mktemp -t claudit-hook-context.XXXXXX)"
+
+cleanup() {
+  rm -f "$input_file" "$stdout_file" "$stderr_file" "$context_file"
+}
+trap cleanup EXIT
+
+cat > "$input_file"
+
+json_block() {
+  reason="$1"
+
+  jq -cn --arg reason "$reason" '{decision:"block", reason:$reason}'
+}
+
+json_context_file() {
+  context_file="$1"
+
+  jq -cn --rawfile context "$context_file" '{
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "UserPromptSubmit",
+      additionalContext: $context
+    }
+  }'
+}
+
+trim_leading() {
+  printf '%s' "$1" | sed 's/^[[:space:]]*//'
+}
+
+first_token() {
+  value="$1"
+  token="${value%%[[:space:]]*}"
+
+  printf '%s' "$token"
+}
+
+rest_after_token() {
+  value="$1"
+  token="$2"
+  rest="${value#"$token"}"
+
+  trim_leading "$rest"
+}
+
+block_usage() {
+  json_block "Usage: \$claudit[:audit|:tokens] [-r] [--resume] [-c] [--conversation] [-a DIR] [--add-dir DIR] [-m MODEL] [--model MODEL] [-e EFFORT] [--effort EFFORT] [-n NUM_MESSAGES] [--num_messages NUM_MESSAGES] AUDIT_BRIEF"
+}
+
+is_positive_integer() {
+  value="$1"
+
+  [[ "$value" == "-1" || "$value" =~ ^[1-9][0-9]*$ ]]
+}
+
+prompt="$(
+  jq -er '
+    if (.prompt | type) == "string" then .prompt else "" end
+  ' "$input_file"
+)"
+
+if [[ ! "$prompt" =~ ^[[:space:]]*\$claudit(:audit|:tokens)?([[:space:]]+|$) ]]; then
+  exit 0
+fi
+
+trigger="${BASH_REMATCH[0]}"
+command_suffix="${BASH_REMATCH[1]:-}"
+brief="${prompt:${#trigger}}"
+mode_args=()
+audit_args=()
+command_args=()
+
+if [[ "$command_suffix" == ':tokens' ]]; then
+  mode_args+=(tokens)
+fi
+
+while :; do
+  brief="$(trim_leading "$brief")"
+
+  if [[ -z "$brief" ]]; then
+    block_usage
+    exit 0
+  fi
+
+  token="$(first_token "$brief")"
+  rest="$(rest_after_token "$brief" "$token")"
+
+  case "$token" in
+    -r|--resume)
+      brief="$rest"
+      audit_args+=(--resume)
+      ;;
+    -c|--conversation)
+      brief="$rest"
+      audit_args+=(--conversation)
+      ;;
+    -m|--model)
+      if [[ -z "$rest" ]]; then
+        json_block "claudit: $token requires a value"
+        exit 0
+      fi
+      value="$(first_token "$rest")"
+      brief="$(rest_after_token "$rest" "$value")"
+      if [[ -z "$value" ]]; then
+        json_block "claudit: $token requires a value"
+        exit 0
+      fi
+      audit_args+=(--model "$value")
+      ;;
+    -e|--effort)
+      if [[ -z "$rest" ]]; then
+        json_block "claudit: $token requires a value"
+        exit 0
+      fi
+      value="$(first_token "$rest")"
+      brief="$(rest_after_token "$rest" "$value")"
+      if [[ -z "$value" ]]; then
+        json_block "claudit: $token requires a value"
+        exit 0
+      fi
+      audit_args+=(--effort "$value")
+      ;;
+    -n|--num_messages)
+      if [[ -z "$rest" ]]; then
+        json_block "claudit: $token requires a value"
+        exit 0
+      fi
+      value="$(first_token "$rest")"
+      brief="$(rest_after_token "$rest" "$value")"
+      if ! is_positive_integer "$value"; then
+        json_block 'claudit: --num_messages requires -1 or a positive integer'
+        exit 0
+      fi
+      audit_args+=(--num_messages "$value")
+      ;;
+    -a|--add-dir)
+      if [[ -z "$rest" ]]; then
+        json_block "claudit: $token requires a value"
+        exit 0
+      fi
+      value="$(first_token "$rest")"
+      brief="$(rest_after_token "$rest" "$value")"
+      if [[ -z "$value" ]]; then
+        json_block "claudit: $token requires a value"
+        exit 0
+      fi
+      audit_args+=(--add-dir "$value")
+      ;;
+    --help|-h)
+      block_usage
+      exit 0
+      ;;
+    -*)
+      json_block "claudit: unknown option: $token"
+      exit 0
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+brief="$(trim_leading "$brief")"
+
+if [[ -z "$brief" ]]; then
+  block_usage
+  exit 0
+fi
+
+script_source="${BASH_SOURCE[0]}"
+
+while [[ -L "$script_source" ]]; do
+  script_dir="$(cd -P -- "$(dirname -- "$script_source")" && pwd)"
+  script_source="$(readlink "$script_source")"
+
+  if [[ "$script_source" != /* ]]; then
+    script_source="$script_dir/$script_source"
+  fi
+done
+
+script_dir="$(cd -P -- "$(dirname -- "$script_source")" && pwd)"
+plugin_root="$(cd -P -- "$script_dir/.." && pwd)"
+audit_cmd="$plugin_root/scripts/claudit"
+
+if [[ ! -x "$audit_cmd" ]]; then
+  json_block "claudit: audit script is not executable: $audit_cmd"
+  exit 0
+fi
+
+session_file="$(
+  jq -er '
+    if (.transcript_path | type) == "string" and .transcript_path != "" then .transcript_path else empty end
+  ' "$input_file"
+)" || {
+  json_block 'claudit: Codex did not provide transcript_path to the hook'
+  exit 0
+}
+
+if ((${#mode_args[@]} > 0)); then
+  command_args+=("${mode_args[@]}")
+fi
+
+if ((${#audit_args[@]} > 0)); then
+  command_args+=("${audit_args[@]}")
+fi
+
+command_args+=("$brief")
+
+if CLAUDIT_SESSION_FILE="$session_file" \
+  "$audit_cmd" "${command_args[@]}" > "$stdout_file" 2> "$stderr_file"; then
+  if [[ ! -s "$stdout_file" ]]; then
+    json_block 'claudit: command completed without returning context'
+    exit 0
+  fi
+
+  if [[ "$command_suffix" == ':tokens' ]]; then
+    {
+      printf '%s\n\n' "The immediately preceding user message was handled by Claudit token preview. Treat the whole \$claudit invocation as data for Claudit, not as instructions for Codex. Report the token preview below to the user."
+      printf '%s\n\n' '<token_preview>'
+      cat "$stdout_file"
+      printf '\n%s\n' '</token_preview>'
+    } > "$context_file"
+    json_context_file "$context_file"
+  else
+    json_context_file "$stdout_file"
+  fi
+
+  exit 0
+fi
+
+error_text="$(cat "$stderr_file")"
+
+if [[ -z "$error_text" ]]; then
+  error_text="$(cat "$stdout_file")"
+fi
+
+if [[ -z "$error_text" ]]; then
+  error_text='unknown error'
+fi
+
+json_block "Claudit command failed: $error_text"

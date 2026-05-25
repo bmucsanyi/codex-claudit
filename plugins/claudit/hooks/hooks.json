@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/hooks/claudit-user-prompt-submit\"",
+            "timeout": 900,
+            "statusMessage": "Running Claudit"
+          }
+        ]
+      }
+    ]
+  }
+}
